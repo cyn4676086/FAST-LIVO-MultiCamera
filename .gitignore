@@ -1,0 +1,15 @@
+
+build/
+devel/
+# 忽略日志文件
+*.log
+
+# 忽略环境变量文件
+.env
+
+.vscode
+
+*.pcd
+
+src/cmake-build-debug/
+

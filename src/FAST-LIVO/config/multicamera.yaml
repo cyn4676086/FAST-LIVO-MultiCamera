@@ -1,0 +1,75 @@
+feature_extract_enable: 1
+point_filter_num: 2
+max_iteration: 6
+dense_map_enable: 1
+filter_size_surf: 0.15
+filter_size_map: 0.3
+cube_side_length: 20
+grid_size: 40
+patch_size: 8
+img_enable: 1
+lidar_enable: 1
+outlier_threshold: 300  # 78 100 156
+ncc_en: false
+ncc_thre: 0
+img_point_cov: 100      # 1000
+laser_point_cov: 0.001  # 0.001
+pose_output_en: false
+delta_time: 0.0
+
+common:
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+
+preprocess:
+  lidar_type: 1  # 1:Livox LiDAR  2:VELO16  3:OUST64  4:XT32  5:Mid360
+  scan_line: 4    # 16  64  32
+  blind: 2      # blind x m disable
+
+mapping:
+  acc_cov_scale: 100
+  gyr_cov_scale: 10000
+  extrinsic_T: [ -0.011, -0.02329, 0.04412 ]  # horizon 0.05512, 0.02226, -0.0297 # mid360 -0.011, -0.02329, 0.04412 # avia 0.04165, 0.02326, -0.0284 
+  extrinsic_R: [ 
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1
+  ]
+
+pcd_save:
+  pcd_save_en: true
+
+cameras:
+  - cam_id: 0
+    img_topic: "/cam0"
+    camera_ns: "/cam0"
+    cam_model: "Pinhole"
+    width: 960
+    height: 720
+    cam_fx: 460.46212917
+    cam_fy: 460.36186539
+    cam_cx: 486.84584172
+    cam_cy: 375.42452885
+    cam_d0: 0.04621996
+    cam_d1: -0.04881841
+    cam_d2: -0.0000643
+    cam_d3: 0.0002615
+    Rcl: [0.00317983, -0.999907, 0.0132752, 
+          -0.0151056, -0.0133218, -0.999797, 
+           0.999881, 0.00297865, -0.0151466]
+    Pcl: [-0.0309436, -0.0447041, -0.0838355]
+
+    
+# 为每个相机的命名空间设置内参
+/cam0/cam_model: "Pinhole"
+/cam0/width: 960
+/cam0/height: 720
+/cam0/cam_fx: 460.46212917
+/cam0/cam_fy: 460.36186539
+/cam0/cam_cx: 486.84584172
+/cam0/cam_cy: 375.42452885
+/cam0/cam_d0: 0.04621996
+/cam0/cam_d1: -0.04881841
+/cam0/cam_d2: -0.0000643
+/cam0/cam_d3: 0.0002615
+
