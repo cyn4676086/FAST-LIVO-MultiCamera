@@ -908,154 +908,276 @@ float LidarSelector::UpdateState(const std::vector<cv::Mat>& imgs, float total_r
         return 0.0f;
     }
 
-
     StatesGroup old_state = (*state);
-    V2D pc; 
-    MD(1,2) Jimg;
-    MD(2,3) Jdpi;
-    MD(1,3) Jdphi, Jdp, JdR, Jdt;
-    VectorXd z;
     bool EKF_end = false;
 
-    /* 初始化变量 */
-    float error = 0.0f, last_error = total_residual, patch_error = 0.0f, propa_error = 0.0f;
+    float error = 0.0f;
+    float last_error = total_residual;
+    n_meas_ = 0;
+
+    // 多相机时的残差向量/雅可比大小
     const int H_DIM = total_points * patch_size_total * imgs.size();
 
-    z.resize(H_DIM);
+    // 分配 z, H_sub
+    VectorXd z(H_DIM);
     z.setZero();
-
     H_sub.resize(H_DIM, 6);
     H_sub.setZero();
 
     for (int iteration = 0; iteration < NUM_MAX_ITERATIONS; iteration++) 
     {
+        ROS_INFO("Iteration %d, Total Error: %f", iteration, last_error);
 
-        double count_outlier = 0;
-        error = 0.0f;
-        propa_error = 0.0f;
-        n_meas_ = 0;
-
-        // 重置 H_sub 和 z
+        // 每次迭代初始化
         H_sub.setZero();
         z.setZero();
+        n_meas_ = 0;
+        error = 0.0f;
+
+        // 从当前状态获取姿态
         M3D Rwi(state->rot_end);
         V3D Pwi(state->pos_end);
 
+        // ------- 遍历所有相机 -------
         for (size_t cam_idx = 0; cam_idx < imgs.size(); cam_idx++)
         {
             camera_manager::Cameras& cam = cameras[cam_idx];
             const cv::Mat& img = imgs[cam_idx];
+            if (img.empty())
+            {
+                ROS_WARN("Empty image at cam_idx=%lu, skip this camera.", cam_idx);
+                continue;
+            }
 
-
+            // 相机到世界的变换
             M3D Rcw = cam.Rci * Rwi.transpose();
             V3D Pcw = -cam.Rci * Rwi.transpose() * Pwi + cam.Pci;
             M3D Jdp_dt = cam.Rci * Rwi.transpose();
 
-            for (int i = 0; i < sub_sparse_map->index.size(); i++) 
+            // 给该相机预留行段偏移
+            // 避免多相机写同一块空间
+            const int row_offset_cam = cam_idx * (total_points * patch_size_total);
+
+            // ------- 遍历每个点 -------
+            for (int i = 0; i < total_points; i++) 
             {
                 PointPtr pt = sub_sparse_map->voxel_points[i];
-                if (pt == nullptr) continue;
+                if (!pt) continue;
 
-                //ROS_INFO("Processing point %d", i);
+                // 每个点先置 patch_error=0
+                float patch_error = 0.0f;
 
+                // 世界->相机坐标
                 V3D pf = Rcw * pt->pos_ + Pcw;
-                pc = cam.cam->world2cam(pf);
-                dpi(pf, Jdpi,cam.fx,cam.fy);
+                // 若深度 <=0，直接跳过
+                if (pf[2] <= 0.0)
+                {
+                    continue;
+                }
+                // 若深度过大/过小，也可跳过(可选)
+                if (pf[2] < 1e-4 || pf[2] > 1e5) 
+                {
+                    // 防止数值极端
+                    continue;
+                }
+
+                // 投影到像素坐标
+                Eigen::Vector2d pc = cam.cam->world2cam(pf);
+                // 若像素坐标爆炸(>1e5)，跳过
+                if (std::fabs(pc[0])>1e5 || std::fabs(pc[1])>1e5) 
+                {
+                    continue;
+                }
+
+                // 计算 dpi
+                MD(2,3) Jdpi;
+                dpi(pf, Jdpi, cam.fx, cam.fy);
+
+                // p_hat
                 M3D p_hat;
                 p_hat << SKEW_SYM_MATRX(pf);
 
-                const float u_ref = pc[0];
-                const float v_ref = pc[1];
+                // scale=1
                 const int scale = 1;
+                int u_ref_i = static_cast<int>(floorf(pc[0] / scale) * scale);
+                int v_ref_i = static_cast<int>(floorf(pc[1] / scale) * scale);
 
-                const int u_ref_i = floorf(pc[0] / scale) * scale;
-                const int v_ref_i = floorf(pc[1] / scale) * scale;
-
-                //ROS_INFO("Projected point to image at (u_ref, v_ref): (%f, %f)", u_ref, v_ref);
-
-                vector<float> P = sub_sparse_map->patch[i];
-
-                const float subpix_u_ref = (u_ref - u_ref_i) / scale;
-                const float subpix_v_ref = (v_ref - v_ref_i) / scale;
-                const float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
-                const float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
-                const float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
-                const float w_ref_br = subpix_u_ref * subpix_v_ref;
-
-                //ROS_INFO("Computed weights: TL=%f, TR=%f, BL=%f, BR=%f", w_ref_tl, w_ref_tr, w_ref_bl, w_ref_br);
-
-                for (int x = 0; x < patch_size; x++) 
+                // 基本边界检查(含patch_size_half范围)
+                if (u_ref_i - patch_size_half < 0 || u_ref_i + patch_size_half >= img.cols ||
+                    v_ref_i - patch_size_half < 0 || v_ref_i + patch_size_half >= img.rows )
                 {
-                    uint8_t* img_ptr = (uint8_t*)img.data + (v_ref_i + x * scale - patch_size_half * scale) * img.cols + u_ref_i - patch_size_half * scale;
-                    for (int y = 0; y < patch_size; ++y, img_ptr += scale) 
-                    {
-                        float du = 0.5f * ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * img.cols + scale] + w_ref_br * img_ptr[scale * img.cols + scale * 2])
-                                        - (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * img.cols - scale] + w_ref_br * img_ptr[scale * img.cols]));
-                        float dv = 0.5f * ((w_ref_tl * img_ptr[scale * img.cols] + w_ref_tr * img_ptr[scale + scale * img.cols] + w_ref_bl * img_ptr[img.cols * scale * 2] + w_ref_br * img_ptr[img.cols * scale * 2 + scale])
-                                        - (w_ref_tl * img_ptr[-scale * img.cols] + w_ref_tr * img_ptr[-scale * img.cols + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
-
-                        Jimg << du, dv;
-                        Jimg = Jimg * (1.0 / scale);
-                        Jdphi = Jimg * Jdpi * p_hat;
-                        Jdp = -Jimg * Jdpi;
-                        JdR = Jdphi * cam.Jdphi_dR + Jdp * cam.Jdp_dR;
-                        Jdt = Jdp * Jdp_dt;
-
-                        double res = w_ref_tl*img_ptr[0] + w_ref_tr*img_ptr[scale] + w_ref_bl*img_ptr[scale*width] + w_ref_br*img_ptr[scale*width+scale]  - P[patch_size_total*level + x*patch_size+y];
-                        z(i*patch_size_total+x*patch_size+y) = res;
-
-                        patch_error += res * res;
-                        n_meas_++;
-                        H_sub.block<1,6>(i*patch_size_total+x*patch_size+y,0) << JdR, Jdt;
-                    }
+                    continue;
                 }
+
+                // 取参考patch
+                std::vector<float>& P = sub_sparse_map->patch[i];
+
+                // 计算双线性插值系数
+                float subpix_u_ref = (pc[0] - (float)u_ref_i)/scale;
+                float subpix_v_ref = (pc[1] - (float)v_ref_i)/scale;
+                float w_ref_tl = (1.f - subpix_u_ref)*(1.f - subpix_v_ref);
+                float w_ref_tr = subpix_u_ref*(1.f - subpix_v_ref);
+                float w_ref_bl = (1.f - subpix_u_ref)*subpix_v_ref;
+                float w_ref_br = subpix_u_ref*subpix_v_ref;
+
+                //ROS_INFO("Processing point %d (cam_idx=%lu): (u_ref, v_ref)=(%.3f,%.3f), w=[%.3f, %.3f, %.3f, %.3f]",i, cam_idx, pc[0], pc[1], w_ref_tl, w_ref_tr, w_ref_bl, w_ref_br);
+
+                // ------- 遍历patch x方向 -------
+                for (int x = 0; x < patch_size; x++)
+                {
+                    int row_img = (v_ref_i - patch_size_half) + x*scale;
+                    // 行偏移(针对当前相机+当前点)
+                    int row_offset_pt = row_offset_cam + i*patch_size_total + x*patch_size;
+
+                    // 行首指针
+                    uint8_t* row_ptr = (uint8_t*)img.data + row_img*img.cols + (u_ref_i - patch_size_half);
+
+                    // ------- 遍历patch y方向 -------
+                    for (int y = 0; y < patch_size; y++)
+                    {
+                        int col_img = (u_ref_i - patch_size_half) + y*scale;
+                        int row_idx = row_offset_pt + y;
+
+                        // 检查 row_idx
+                        if (row_idx<0 || row_idx>=H_DIM)
+                        {
+                            ROS_ERROR("row_idx out of range! row_idx=%d, H_DIM=%d", row_idx, H_DIM);
+                            continue;
+                        }
+
+                        // 当前像素指针
+                        uint8_t* img_ptr = row_ptr + y*scale;
+
+                        // 再次检查周边像素
+                        if (col_img-1<0 || col_img+1>=img.cols || row_img-1<0 || row_img+1>=img.rows)
+                        {
+                            // 无法算du,dv，跳过
+                            continue;
+                        }
+
+                        // 计算 du
+                        float du = 0.5f * (
+                            ( w_ref_tl * img_ptr[ scale ]
+                              + w_ref_tr * img_ptr[ scale*2 ]
+                              + w_ref_bl * img_ptr[ scale*img.cols + scale ]
+                              + w_ref_br * img_ptr[ scale*img.cols + scale*2] )
+                            - ( w_ref_tl * img_ptr[ -scale ]
+                              + w_ref_tr * img_ptr[ 0 ]
+                              + w_ref_bl * img_ptr[ scale*img.cols - scale ]
+                              + w_ref_br * img_ptr[ scale*img.cols ] )
+                        );
+
+                        // 计算 dv
+                        float dv = 0.5f * (
+                            ( w_ref_tl * img_ptr[ scale*img.cols ]
+                              + w_ref_tr * img_ptr[ scale + scale*img.cols ]
+                              + w_ref_bl * img_ptr[ img.cols*scale*2 ]
+                              + w_ref_br * img_ptr[ img.cols*scale*2 + scale] )
+                            - ( w_ref_tl * img_ptr[ -scale*img.cols ]
+                              + w_ref_tr * img_ptr[ -scale*img.cols + scale ]
+                              + w_ref_bl * img_ptr[ 0 ]
+                              + w_ref_br * img_ptr[ scale ] )
+                        );
+
+                        MD(1,2) Jimg;
+                        Jimg << du, dv;
+                        Jimg *= (1.0f / (float)scale);
+
+                        // Jdphi, Jdp, ...
+                        MD(1,3) Jdphi = Jimg * Jdpi * p_hat;
+                        MD(1,3) Jdp   = -Jimg * Jdpi;
+                        MD(1,3) JdR   = Jdphi*cam.Jdphi_dR + Jdp*cam.Jdp_dR;
+                        MD(1,3) Jdt   = Jdp * Jdp_dt;
+
+                        // 计算光度残差 current - P[..]
+                        float current_val =
+                                w_ref_tl*img_ptr[0]
+                              + w_ref_tr*img_ptr[scale]
+                              + w_ref_bl*img_ptr[scale*img.cols]
+                              + w_ref_br*img_ptr[scale*img.cols + scale];
+
+                        double ref_val = (double)P[patch_size_total*level + x*patch_size + y];
+                        double res = (double)current_val - ref_val;
+
+                        // 写入 z, H_sub
+                        z(row_idx) = res;
+                        H_sub.block<1,6>(row_idx, 0) << JdR, Jdt;
+
+                        patch_error += (float)(res*res);
+                        n_meas_++;
+                    } // y
+                } // x
+
+                // 将该点误差累加到全局
                 sub_sparse_map->errors[i] = patch_error;
                 error += patch_error;
-            }
-        }
-        if (n_meas_ == 0) 
+            } // end for i
+        } // end for cam_idx
+
+        // 若无测量
+        if (n_meas_ == 0)
         {
+            //ROS_WARN("No valid measurements, break from iteration.");
             break;
         }
-        // 误差归一化
-        error /= n_meas_;
 
+        // 均方误差
+        error /= (float)n_meas_;
+        //ROS_INFO("Total Error after this iteration: %f", error);
 
-        if (error <= last_error) 
+        // -------- EKF/GN 更新 --------
+        if (error <= last_error)
         {
             old_state = (*state);
             last_error = error;
 
+            // 构造法方程
             auto H_sub_T = H_sub.transpose();
-            H_T_H.block<6, 6>(0, 0) = H_sub_T * H_sub;
-            MD(DIM_STATE, DIM_STATE) K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+            H_T_H.setZero();
+            H_T_H.block<6,6>(0,0) = H_sub_T * H_sub;
+
+            MD(DIM_STATE, DIM_STATE) K_1 = 
+                (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+
             auto HTz = H_sub_T * z;
+
+            // 如果存在先验: 
             auto vec = (*state_propagat) - (*state);
 
-            G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
-            auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+            G.block<DIM_STATE,6>(0,0) = 
+                K_1.block<DIM_STATE,6>(0,0) * H_T_H.block<6,6>(0,0);
+
+            auto solution = 
+                -K_1.block<DIM_STATE,6>(0,0)*HTz 
+                + vec 
+                - G.block<DIM_STATE,6>(0,0)*vec.block<6,1>(0,0);
 
             (*state) += solution;
 
-            auto rot_add = solution.block<3, 1>(0, 0);
-            auto t_add = solution.block<3, 1>(3, 0);
+            auto rot_add = solution.block<3,1>(0,0);
+            auto t_add   = solution.block<3,1>(3,0);
+            //ROS_INFO("State updated. dRot=%f deg, dTrans=%f", rot_add.norm()*57.3, t_add.norm());
 
-            if ((rot_add.norm() * 57.3f < 0.001f) && (t_add.norm() * 100.0f < 0.001f)) 
+            // 收敛检查
+            if ((rot_add.norm()*57.3f < 0.001f) && 
+                (t_add.norm()*100.0f < 0.001f))
             {
                 EKF_end = true;
             }
-        } 
-        else 
+        }
+        else
         {
+            // 回退
             (*state) = old_state;
             EKF_end = true;
         }
 
-        if (iteration == NUM_MAX_ITERATIONS || EKF_end) 
+        if (iteration == NUM_MAX_ITERATIONS || EKF_end)
         {
             break;
         }
     }
+
     ROS_INFO("UpdateState finished with last error: %f", last_error);
     return last_error;
 }
