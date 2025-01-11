@@ -465,6 +465,7 @@ cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr& img_msg) {
   img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
   return img;
 }
+
 void img_cbk(const sensor_msgs::ImageConstPtr& msg, 
             int cam_id, 
             lidar_selection::LidarSelectorPtr lidar_selector,
@@ -520,87 +521,63 @@ void img_cbk(const sensor_msgs::ImageConstPtr& msg,
     ROS_INFO("cam %d new image", cam_id);
 }
 
-bool sync_packages(LidarMeasureGroup &meas)
-{
-    if ((lidar_buffer.empty() && img_buffers[0].empty())) { // has lidar topic or img topic?
+
+bool sync_packages(LidarMeasureGroup &meas) {
+    if (lidar_buffer.empty() && img_buffers.empty()) {
         return false;
     }
-    // ROS_ERROR("In sync");
-    if (meas.is_lidar_end) // If meas.is_lidar_end==true, means it just after scan end, clear all buffer in meas.
-    {
+
+    // 如果刚刚完成一个激光雷达扫描，清空测量缓存
+    if (meas.is_lidar_end) {
         meas.measures.clear();
         meas.is_lidar_end = false;
     }
-    
-    if (!lidar_pushed) { // If not in lidar scan, need to generate new meas
+
+    // 如果不在激光雷达扫描中，初始化新的激光雷达数据
+    if (!lidar_pushed) {
         if (lidar_buffer.empty()) {
-            // ROS_ERROR("out sync");
             return false;
         }
-        meas.lidar = lidar_buffer.front(); // push the firsrt lidar topic
-        if(meas.lidar->points.size() <= 1)
-        {
+        meas.lidar = lidar_buffer.front();
+        if (meas.lidar->points.size() <= 1) {
             mtx_buffer.lock();
-            if (img_buffers[0].size()>0) // temp method, ignore img topic when no lidar points, keep sync
-            {
-                lidar_buffer.pop_front();
-                for (size_t cam_idx = 0; cam_idx < img_buffers.size(); ++cam_idx) {
-                    img_buffers[cam_idx].pop_front();
-                    img_time_buffers[cam_idx].pop_front();
-                }
+            lidar_buffer.pop_front();
+            for (auto &buffer : img_buffers) {
+                if (!buffer.empty()) buffer.pop_front();
             }
             mtx_buffer.unlock();
             sig_buffer.notify_all();
-            // ROS_ERROR("out sync");
             return false;
         }
-        sort(meas.lidar->points.begin(), meas.lidar->points.end(), time_list); // sort by sample timestamp
-        meas.lidar_beg_time = time_buffer.front(); // generate lidar_beg_time
-        lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000); // calc lidar scan end time
-        lidar_pushed = true; // flag
+        // 排序激光雷达点云并计算时间范围
+        sort(meas.lidar->points.begin(), meas.lidar->points.end(), time_list);
+        meas.lidar_beg_time = time_buffer.front();
+        lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / 1000.0;
+        lidar_pushed = true;
     }
 
-    if (img_buffers[0].empty()) { // no img topic, means only has lidar topic
-        if (last_timestamp_imu < lidar_end_time+0.02) { // imu message needs to be larger than lidar_end_time, keep complete propagate.
-            // ROS_ERROR("out sync");
-            return false;
+    // 检查是否至少有一个相机有可用数据
+    bool has_img = false;
+    for (const auto &buffer : img_buffers) {
+        if (!buffer.empty()) {
+            has_img = true;
+            break;
         }
-        struct MeasureGroup m; //standard method to keep imu message.
-        double imu_time = imu_buffer.front()->header.stamp.toSec();
-        m.imu.clear();
-        mtx_buffer.lock();
-        while ((!img_buffers[0].empty() && (imu_time<lidar_end_time))) {
-            imu_time = imu_buffer.front()->header.stamp.toSec();
-            if(imu_time > lidar_end_time) break;
-            m.imu.push_back(imu_buffer.front());
-            imu_buffer.pop_front();
-        }
-        lidar_buffer.pop_front();
-        time_buffer.pop_front();
-        mtx_buffer.unlock();
-        sig_buffer.notify_all();
-        lidar_pushed = false; // sync one whole lidar scan.
-        meas.is_lidar_end = true; // process lidar topic, so timestamp should be lidar scan end.
-        meas.measures.push_back(m);
-        // ROS_ERROR("out sync");
-        return true;
     }
-    struct MeasureGroup m;
-    
-    if ((img_time_buffers[0].front()>lidar_end_time) )
-    { // has img topic, but img topic timestamp larger than lidar end time, process lidar topic.
-        if (last_timestamp_imu < lidar_end_time+0.02) 
-        {
-            // ROS_ERROR("out sync");
+
+    // 没有图像数据，仅处理激光雷达和 IMU 数据
+    if (!has_img) {
+        if (last_timestamp_imu < lidar_end_time + 0.02) {
             return false;
         }
+        struct MeasureGroup m;
         double imu_time = imu_buffer.front()->header.stamp.toSec();
         m.imu.clear();
+
         mtx_buffer.lock();
-        while ((!imu_buffer.empty() && (imu_time<lidar_end_time))) 
-        {
+        while (!imu_buffer.empty() && imu_time < lidar_end_time) {
             imu_time = imu_buffer.front()->header.stamp.toSec();
-            if(imu_time > lidar_end_time) break;
+            if (imu_time > lidar_end_time) break;
             m.imu.push_back(imu_buffer.front());
             imu_buffer.pop_front();
         }
@@ -611,48 +588,104 @@ bool sync_packages(LidarMeasureGroup &meas)
         lidar_pushed = false;
         meas.is_lidar_end = true;
         meas.measures.push_back(m);
+        return true;
     }
-    else 
+
+    // -------------------------
+    // ** 核心修改：一次性收集所有相机的图像 **
+    // -------------------------
     {
-        double img_start_time = img_time_buffers[0].front(); // process img topic, record timestamp
-        if (last_timestamp_imu < img_start_time) 
-        {
-            return false;
+        // 首先找出所有相机中最早的图像时间 = min_img_time
+        // （也可以考虑 max_img_time 做策略，这取决于您的对齐方式）
+        double min_img_time = 1e20;  // 假设一个很大数
+        for (int cam_idx = 0; cam_idx < (int)img_buffers.size(); ++cam_idx) {
+            if (!img_time_buffers[cam_idx].empty()) {
+                double t = img_time_buffers[cam_idx].front();
+                if (t < min_img_time) {
+                    min_img_time = t;
+                }
+            }
         }
 
-        double imu_time = imu_buffer.front()->header.stamp.toSec();
-        m.imu.clear();
-        m.img_offset_time = img_start_time - meas.lidar_beg_time; // record img offset time, it shoule be the Kalman update timestamp.
-
-        for (size_t cam_idx = 0; cam_idx < img_buffers.size(); ++cam_idx) {
-            if (img_buffers[cam_idx].empty()) {
-                ROS_WARN("Camera %zu buffer is empty unexpectedly.", cam_idx);
+        // 如果最早的一张图像还比 lidar_end_time 晚，说明所有相机都赶不上本次激光
+        if (min_img_time > lidar_end_time) {
+            if (last_timestamp_imu < lidar_end_time + 0.02) {
                 return false;
             }
-            m.imgs.push_back(img_buffers[cam_idx].front());
-        }
+            // 做 "仅雷达 + IMU" 处理
+            struct MeasureGroup m;
+            double imu_time = imu_buffer.front()->header.stamp.toSec();
+            m.imu.clear();
 
-        mtx_buffer.lock();
+            mtx_buffer.lock();
+            while (!imu_buffer.empty() && imu_time < lidar_end_time) {
+                imu_time = imu_buffer.front()->header.stamp.toSec();
+                if (imu_time > lidar_end_time) break;
+                m.imu.push_back(imu_buffer.front());
+                imu_buffer.pop_front();
+            }
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            mtx_buffer.unlock();
+            sig_buffer.notify_all();
 
-        while ((!imu_buffer.empty() && (imu_time<img_start_time))) 
-        {
-            imu_time = imu_buffer.front()->header.stamp.toSec();
-            if(imu_time > img_start_time) break;
-            m.imu.push_back(imu_buffer.front());
-            imu_buffer.pop_front();
+            lidar_pushed = false;
+            meas.is_lidar_end = true;
+            meas.measures.push_back(m);
+            return true;
         }
-        
-        for (size_t cam_idx = 0; cam_idx < img_buffers.size(); ++cam_idx) {
-            img_buffers[cam_idx].pop_front();
-            img_time_buffers[cam_idx].pop_front();
-        }
+        else {
+            // 进入 "雷达扫描内 + 多相机" 处理
+            // 以min_img_time作为这一组相机图像的时刻
+            // 这里假设所有相机都硬件同步 -> 各 cam_idx 的图像时间应相同/极其接近
+            // 如果不完全相同，可再做一些判断或插值
+            double img_time = min_img_time;
+            if (last_timestamp_imu < img_time) {
+                return false;
+            }
 
-        mtx_buffer.unlock();
-        sig_buffer.notify_all();
-        meas.is_lidar_end = false; // has img topic in lidar scan, so flag "is_lidar_end=false" 
-        meas.measures.push_back(m);
+            // 同一组测量
+            struct MeasureGroup m;
+            m.imu.clear();
+            m.img_offset_time = img_time - meas.lidar_beg_time;
+
+            // **一次性收集所有相机的图片**
+            mtx_buffer.lock();
+            for (int cam_idx = 0; cam_idx < (int)img_buffers.size(); ++cam_idx) {
+                // 如果这个相机的前沿时间 <= lidar_end_time，才算进本次
+                if (!img_buffers[cam_idx].empty()) {
+                    double cur_img_time = img_time_buffers[cam_idx].front();
+                    if (cur_img_time <= lidar_end_time + 1e-6) {
+                        // push 此相机图像到 measure
+                        m.imgs.push_back(img_buffers[cam_idx].front());
+                        // 弹出
+                        img_buffers[cam_idx].pop_front();
+                        img_time_buffers[cam_idx].pop_front();
+                    } else {
+                        // 若这个相机最早图像时间 > lidar_end_time
+                        // 就暂时不放进来；如果您想强制对齐，也可直接break
+                    }
+                }
+            }
+
+            // 收集 IMU 数据直到 img_time
+            double imu_time = imu_buffer.empty() ? 0.0 : imu_buffer.front()->header.stamp.toSec();
+            while (!imu_buffer.empty() && (imu_time < img_time)) {
+                imu_time = imu_buffer.front()->header.stamp.toSec();
+                if (imu_time > img_time) break;
+                m.imu.push_back(imu_buffer.front());
+                imu_buffer.pop_front();
+            }
+            mtx_buffer.unlock();
+            sig_buffer.notify_all();
+
+            meas.is_lidar_end = false; // 未结束雷达帧
+            meas.measures.push_back(m);
+            return true;
+        }
     }
-    return true;
+    // 如果能进入到这里，说明没有处理分支，返回false
+    return false;
 }
 
 
@@ -1169,21 +1202,20 @@ int main(int argc, char** argv)
     // 定义一个容器来存储订阅器，以保持它们的生命周期
     std::vector<ros::Subscriber> img_subs;
     img_subs.reserve(num_cameras); // 预留空间
-    for(int i = 0; i < num_cameras; i++) {
-        if (cameras_info[i].img_topic.empty()) {
-            ROS_ERROR("Invalid topic name for camera %d", i);
-            continue; // 跳过无效的主题
-        }
-
-        // 使用 C++14 的泛型捕获，避免引用悬挂
+    
+     for(int i = 0; i < num_cameras; i++) {
+        // 使用C++11 lambda表达式绑定 cam_id 和 lidar_selector
         ros::Subscriber sub_img = nh.subscribe<sensor_msgs::Image>(
-            cameras_info[i].img_topic,
-            200,
-            [i, lidar_selector, cameras_info](const sensor_msgs::ImageConstPtr& msg) {
+            cameras_info[i].img_topic,  // topic 名
+            200,                       // queue_size
+            [i, &cameras_info, lidar_selector](const sensor_msgs::ImageConstPtr& msg) {
                 img_cbk(msg, i, lidar_selector, cameras_info); 
             }
         );
-        ROS_INFO("Subscribed to topic: %s for camera ID: %d", cameras_info[i].img_topic.c_str(), cameras_info[i].cam_id);
+        ROS_INFO("Subscribing to topic: %s", cameras_info[i].img_topic.c_str());
+        if (cameras_info[i].img_topic.empty()) {
+            ROS_ERROR("Invalid topic name for camera %d", i);
+        }
         img_subs.emplace_back(sub_img);
     }
     pcl_wait_pub->clear();
