@@ -465,7 +465,6 @@ cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr& img_msg) {
   img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
   return img;
 }
-
 void img_cbk(const sensor_msgs::ImageConstPtr& msg, 
             int cam_id, 
             lidar_selection::LidarSelectorPtr lidar_selector,
@@ -488,8 +487,11 @@ void img_cbk(const sensor_msgs::ImageConstPtr& msg,
         ROS_ERROR("cam %d back (now: %f, last: %f)", 
                   cam_id, msg_header_time, last_timestamp_imgs[cam_id]);
         std::lock_guard<std::mutex> lock(mtx_buffer);
-        img_buffers[cam_id].clear();
-        img_time_buffers[cam_id].clear();
+        for (int cam_idx = 0; cam_idx < cameras_info.size(); ++cam_idx) {
+            img_buffers[cam_idx].clear();
+            img_time_buffers[cam_idx].clear();
+        }
+        
         return;
     }
 
@@ -521,103 +523,116 @@ void img_cbk(const sensor_msgs::ImageConstPtr& msg,
     ROS_INFO("cam %d new image", cam_id);
 }
 
-
-bool sync_packages(LidarMeasureGroup &meas) {
+bool sync_packages(LidarMeasureGroup &meas)
+{
+    // 1) 如果激光 / 图像都还没有，直接返回
     if (lidar_buffer.empty() && img_buffers.empty()) {
         return false;
     }
 
-    // 如果刚刚完成一个激光雷达扫描，清空测量缓存
+    // 如果上一帧激光扫描已经完成，清空 measures
     if (meas.is_lidar_end) {
         meas.measures.clear();
         meas.is_lidar_end = false;
     }
 
-    // 如果不在激光雷达扫描中，初始化新的激光雷达数据
+    // 如果还没装载新的激光帧，就先从 lidar_buffer 里拿一帧
     if (!lidar_pushed) {
         if (lidar_buffer.empty()) {
-            return false;
+            return false; // 还没有新的激光帧
         }
         meas.lidar = lidar_buffer.front();
+        // 若点太少，丢掉
         if (meas.lidar->points.size() <= 1) {
-            mtx_buffer.lock();
+            std::lock_guard<std::mutex> lock(mtx_buffer);
             lidar_buffer.pop_front();
+            // 也顺便丢掉对应的图像，防止越积越多
             for (auto &buffer : img_buffers) {
-                if (!buffer.empty()) buffer.pop_front();
+                if (!buffer.empty()) {
+                    buffer.pop_front();
+                }
             }
-            mtx_buffer.unlock();
             sig_buffer.notify_all();
             return false;
         }
-        // 排序激光雷达点云并计算时间范围
+        // 排序并计算激光扫描结束时间
         sort(meas.lidar->points.begin(), meas.lidar->points.end(), time_list);
         meas.lidar_beg_time = time_buffer.front();
         lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / 1000.0;
+
         lidar_pushed = true;
     }
 
-    // 检查是否至少有一个相机有可用数据
+    // 2) 检查是否有图像，如果完全没有图像，则只做“激光 + IMU”
     bool has_img = false;
-    for (const auto &buffer : img_buffers) {
+    for (auto &buffer : img_buffers) {
         if (!buffer.empty()) {
             has_img = true;
             break;
         }
     }
-
-    // 没有图像数据，仅处理激光雷达和 IMU 数据
     if (!has_img) {
+        // 没有图像数据 => 只做“激光 + IMU”
         if (last_timestamp_imu < lidar_end_time + 0.02) {
-            return false;
+            return false; // IMU 数据也不够，只能再等
         }
-        struct MeasureGroup m;
-        double imu_time = imu_buffer.front()->header.stamp.toSec();
+        // 组建一个 MeasureGroup，仅包含激光 + IMU
+        MeasureGroup m;
         m.imu.clear();
+        double imu_time = imu_buffer.front()->header.stamp.toSec();
 
-        mtx_buffer.lock();
-        while (!imu_buffer.empty() && imu_time < lidar_end_time) {
-            imu_time = imu_buffer.front()->header.stamp.toSec();
-            if (imu_time > lidar_end_time) break;
-            m.imu.push_back(imu_buffer.front());
-            imu_buffer.pop_front();
+        // 收集 IMU 到激光结束时刻
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            while (!imu_buffer.empty() && imu_time < lidar_end_time) {
+                imu_time = imu_buffer.front()->header.stamp.toSec();
+                if (imu_time > lidar_end_time) break;
+                m.imu.push_back(imu_buffer.front());
+                imu_buffer.pop_front();
+            }
+            // 弹出这帧激光
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
         }
-        lidar_buffer.pop_front();
-        time_buffer.pop_front();
-        mtx_buffer.unlock();
         sig_buffer.notify_all();
+
+        // 当前激光扫描结束
         lidar_pushed = false;
         meas.is_lidar_end = true;
         meas.measures.push_back(m);
         return true;
     }
 
-    // -------------------------
-    // ** 核心修改：一次性收集所有相机的图像 **
-    // -------------------------
+    // 3) 如果相机硬件同步，则所有相机的“front()”时间应该几乎相同。
+    //    但为了安全，仍需先检查 “是否所有相机都有可用图像”。
     {
-        // 首先找出所有相机中最早的图像时间 = min_img_time
-        // （也可以考虑 max_img_time 做策略，这取决于您的对齐方式）
-        double min_img_time = 1e20;  // 假设一个很大数
+        bool all_cams_ready = true;
         for (int cam_idx = 0; cam_idx < (int)img_buffers.size(); ++cam_idx) {
-            if (!img_time_buffers[cam_idx].empty()) {
-                double t = img_time_buffers[cam_idx].front();
-                if (t < min_img_time) {
-                    min_img_time = t;
-                }
+            if (img_buffers[cam_idx].empty()) {
+                all_cams_ready = false;
+                break;
             }
         }
+        // 如果某个相机没有任何图像，则还需要等
+        if (!all_cams_ready) {
+            return false;
+        }
+    }
 
-        // 如果最早的一张图像还比 lidar_end_time 晚，说明所有相机都赶不上本次激光
-        if (min_img_time > lidar_end_time) {
-            if (last_timestamp_imu < lidar_end_time + 0.02) {
-                return false;
-            }
-            // 做 "仅雷达 + IMU" 处理
-            struct MeasureGroup m;
-            double imu_time = imu_buffer.front()->header.stamp.toSec();
-            m.imu.clear();
+    // 4) 取“第0路相机”做参考（因为硬同步，理论上其它相机 front() 时间戳也相近）
+    double ref_cam_time = img_time_buffers[0].front();
+    // 如果该时刻还大于激光结束时刻 => 那么图像比激光晚，说明这一帧图像赶不上当前激光
+    if (ref_cam_time > lidar_end_time) {
+        // => 只能做“激光 + IMU”
+        if (last_timestamp_imu < lidar_end_time + 0.02) {
+            return false;
+        }
+        MeasureGroup m;
+        m.imu.clear();
+        double imu_time = imu_buffer.front()->header.stamp.toSec();
 
-            mtx_buffer.lock();
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
             while (!imu_buffer.empty() && imu_time < lidar_end_time) {
                 imu_time = imu_buffer.front()->header.stamp.toSec();
                 if (imu_time > lidar_end_time) break;
@@ -626,68 +641,61 @@ bool sync_packages(LidarMeasureGroup &meas) {
             }
             lidar_buffer.pop_front();
             time_buffer.pop_front();
-            mtx_buffer.unlock();
-            sig_buffer.notify_all();
-
-            lidar_pushed = false;
-            meas.is_lidar_end = true;
-            meas.measures.push_back(m);
-            return true;
         }
-        else {
-            // 进入 "雷达扫描内 + 多相机" 处理
-            // 以min_img_time作为这一组相机图像的时刻
-            // 这里假设所有相机都硬件同步 -> 各 cam_idx 的图像时间应相同/极其接近
-            // 如果不完全相同，可再做一些判断或插值
-            double img_time = min_img_time;
-            if (last_timestamp_imu < img_time) {
-                return false;
-            }
+        sig_buffer.notify_all();
 
-            // 同一组测量
-            struct MeasureGroup m;
-            m.imu.clear();
-            m.img_offset_time = img_time - meas.lidar_beg_time;
+        lidar_pushed = false;
+        meas.is_lidar_end = true;
+        meas.measures.push_back(m);
+        return true;
+    }
+    else {
+        // 图像时刻在当前雷达帧区间内 => 做“激光 + IMU + 相机”打包
+        // 如果 IMU 时间还不够到 ref_cam_time，就等
+        if (last_timestamp_imu < ref_cam_time) {
+            return false;
+        }
 
-            // **一次性收集所有相机的图片**
-            mtx_buffer.lock();
-            for (int cam_idx = 0; cam_idx < (int)img_buffers.size(); ++cam_idx) {
-                // 如果这个相机的前沿时间 <= lidar_end_time，才算进本次
-                if (!img_buffers[cam_idx].empty()) {
-                    double cur_img_time = img_time_buffers[cam_idx].front();
-                    if (cur_img_time <= lidar_end_time + 1e-6) {
-                        // push 此相机图像到 measure
-                        m.imgs.push_back(img_buffers[cam_idx].front());
-                        // 弹出
-                        img_buffers[cam_idx].pop_front();
-                        img_time_buffers[cam_idx].pop_front();
-                    } else {
-                        // 若这个相机最早图像时间 > lidar_end_time
-                        // 就暂时不放进来；如果您想强制对齐，也可直接break
-                    }
-                }
-            }
+        // 同一组测量
+        MeasureGroup m;
+        m.imu.clear();
+        m.img_offset_time = ref_cam_time - meas.lidar_beg_time;
 
-            // 收集 IMU 数据直到 img_time
-            double imu_time = imu_buffer.empty() ? 0.0 : imu_buffer.front()->header.stamp.toSec();
-            while (!imu_buffer.empty() && (imu_time < img_time)) {
+        // 收集 IMU 数据直到 ref_cam_time
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            double imu_time = (!imu_buffer.empty()) ? imu_buffer.front()->header.stamp.toSec() : 0.0;
+            while (!imu_buffer.empty() && (imu_time < ref_cam_time)) {
                 imu_time = imu_buffer.front()->header.stamp.toSec();
-                if (imu_time > img_time) break;
+                if (imu_time > ref_cam_time) break;
                 m.imu.push_back(imu_buffer.front());
                 imu_buffer.pop_front();
             }
-            mtx_buffer.unlock();
-            sig_buffer.notify_all();
 
-            meas.is_lidar_end = false; // 未结束雷达帧
-            meas.measures.push_back(m);
-            return true;
+            // **一次性收集所有相机的图片**（硬同步 => 时间戳几乎相同）
+            m.imgs.clear();
+            for (int cam_idx = 0; cam_idx < (int)img_buffers.size(); ++cam_idx) {
+                double this_cam_time = img_time_buffers[cam_idx].front();
+                // 如果跟 ref_cam_time 时间戳差异过大，也可以做些判断，这里简化
+                m.imgs.push_back(img_buffers[cam_idx].front());
+
+                // 弹出
+                img_buffers[cam_idx].pop_front();
+                img_time_buffers[cam_idx].pop_front();
+            }
         }
+        sig_buffer.notify_all();
+
+        // 当前还没有结束这帧雷达（因为这帧雷达可能持续一段时间）
+        // 如果你想“拿到图像就标记结束”，也可以在这里 pop lidar_buffer，但多数情况下是等待激光扫描完毕
+        meas.is_lidar_end = false;
+        meas.measures.push_back(m);
+        return true;
     }
-    // 如果能进入到这里，说明没有处理分支，返回false
+
+    // 如果能走到这里，说明没有进入任何分支，就返回 false
     return false;
 }
-
 
 
 void map_incremental()
@@ -1047,6 +1055,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 void readParameters(ros::NodeHandle &nh, std::vector<camera_manager::Cameras> &cameras)
 {
+    ROS_INFO("Start reading camera parameters.");
+
     // 读取相机列表CamInfo初始化
     XmlRpc::XmlRpcValue cameras_param;
     if (!nh.getParam("cameras", cameras_param)) {
@@ -1202,12 +1212,11 @@ int main(int argc, char** argv)
     // 定义一个容器来存储订阅器，以保持它们的生命周期
     std::vector<ros::Subscriber> img_subs;
     img_subs.reserve(num_cameras); // 预留空间
-    
-     for(int i = 0; i < num_cameras; i++) {
+    for(int i = 0; i < num_cameras; i++) {
         // 使用C++11 lambda表达式绑定 cam_id 和 lidar_selector
         ros::Subscriber sub_img = nh.subscribe<sensor_msgs::Image>(
             cameras_info[i].img_topic,  // topic 名
-            200,                       // queue_size
+            300,                       // queue_size
             [i, &cameras_info, lidar_selector](const sensor_msgs::ImageConstPtr& msg) {
                 img_cbk(msg, i, lidar_selector, cameras_info); 
             }
@@ -1227,7 +1236,7 @@ int main(int argc, char** argv)
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
     ROS_INFO("Subscribing to topic: %s", imu_topic.c_str());
 
-    //image_transport::Publisher img_pub = it.advertise("/rgb_img", 1);
+    image_transport::Publisher img_pub = it.advertise("/rgb_img", 1);
     ros::Publisher pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100);
     ros::Publisher pubVisualCloud = nh.advertise<sensor_msgs::PointCloud2>
@@ -1365,9 +1374,10 @@ int main(int argc, char** argv)
         state_propagat = state;
         #endif
 
-        
-        //LidarMeasures.debug_show();
-        
+        if (lidar_selector->debug)
+        {
+            LidarMeasures.debug_show();
+        }
 
         if (feats_undistort->empty() || (feats_undistort == nullptr))
         {
